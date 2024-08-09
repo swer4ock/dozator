@@ -1,322 +1,325 @@
+
 #include <TFT_eSPI.h>
+#include <HX711.h>
 #include <ESP32Servo.h>
+#include <Arduino.h>
+#include <IRremoteESP8266.h>
+#include <IRrecv.h>
+#include <IRutils.h>
+// Add this line to define the LCD backlight pin
+#define LCDpin 15
 
-Servo myservo;  // создаем объект сервопривода
+#define IR_RECEIVE_PIN 16
+IRrecv irrecv(IR_RECEIVE_PIN);
+decode_results results;
+bool forceUpdate = false; // Флаг принудительного обновления экрана
 
-int servoPin = 1;  // Пин ESP32 для сигнала
+
+const int dtPin = 43;    // Пин DT подключен к GPIO 3
+const int sckPin = 44;   // Пин SCK подключен к GPIO 2
+const int servo1Pin = 2; // Пин для первого сервопривода
+const int servo2Pin = 3; // Пин для второго сервопривода
+const int startButtonPin = 11; // Пин для кнопки открытия сервоприводов
+const int tareButtonPin = 12; // Пин для кнопки тары
+
+
+
+// Пины управления L298N
+const int bin1Pin = 17; //bIN1
+// const int in2Pin = 0; //
+const int pwmbPin = 21; //pwmb еще нужен stby указать
+const int stbyPin = 18;
+
+Servo servo1;
+Servo servo2;
+
+const float calibrationFactor = 0.002496; // Калибровочный коэффициент
+// const int targetWeightThreshold = 100; // Порог веса для закрытия сервоприводов
+int targetWeightThreshold = 100; // Начальное значение, допускается изменение
+
+
+bool servosOpen = false; // Флаг открытия/закрытия сервоприводов
+bool motorRunning = false; // Флаг мотора
+
+TFT_eSPI tft = TFT_eSPI();
+HX711 scale;
+
+unsigned long previousMillis = 0;
+const long interval = 100; // Интервал между измерениями в миллисекундах
+
+// Буфер для усреднения значений веса
+const int weightBufferLength = 10;
+float weightBuffer[weightBufferLength];
+int bufferIndex = 0;
+
+// Прототипы функций
+void displayWeight(float weight, int targetThreshold);
+void openServos();
+void closeServos();
+void startMotor();
+void stopMotor();
+void displayState();
+void tareWeight();
+float getSmoothedWeight(float currentWeight);
+
+
+ 
+void handleIRInput(unsigned long code);
+
 
 void setup() {
-  Serial.begin(115200);  // инициализация серийного соединения для вывода
-  myservo.attach(servoPin);  // подключаем сервопривод к выбранному пину
-  Serial.println("Сервопривод подключен");
+irrecv.enableIRIn(); // Включение приема ИК-сигналов
+
+
+  // Настройка пинов 
+  pinMode(bin1Pin, OUTPUT);
+  // pinMode(in2Pin, OUTPUT);
+  pinMode(pwmbPin, OUTPUT);
+  pinMode(stbyPin, OUTPUT);
+
+
+  // Начальное состояние
+  digitalWrite(bin1Pin, HIGH);
+  // digitalWrite(in2Pin, HIGH);
+  digitalWrite(stbyPin, HIGH); // Выход из режима ожидания
+
+  // Add these lines to configure the LCD backlight pin
+  pinMode(LCDpin, OUTPUT);
+  digitalWrite(LCDpin, HIGH);
+
+
+  // Настройка PWM для управления скоростью мотора (если нужно)
+  //analogWrite(enAPin, 255); // Максимальная скорость
+
+  Serial.begin(115200);
+  scale.begin(dtPin, sckPin);
+
+  tft.init();
+  tft.setRotation(3);
+  //tft.fillScreen(TFT_GREEN);
+  tft.setTextSize(3);
+
+  pinMode(startButtonPin, INPUT_PULLUP);
+  pinMode(tareButtonPin, INPUT_PULLUP);
+
+  servo1.attach(servo1Pin);
+  servo2.attach(servo2Pin);
 }
+
+float previousWeight = 0.0;
+unsigned long startMillis = 0;
+//const int analogInputPin = 4; 
 
 void loop() {
-  // Проверка сервопривода с ограничением до 90 градусов на максимальной скорости
-  Serial.println("Тест до 90 градусов на максимальной скорости:");
+
+ float currentWeight = scale.get_units(1) * calibrationFactor; // Пример получения текущего веса
   
-  myservo.write(0);  // устанавливаем сервопривод в начальное положение
-  delay(500);  // ждем полсекунды для стабилизации
-  
-  myservo.write(90);  // перемещаем сервопривод на 90 градусов
-  delay(500);  // ждем полсекунды для стабилизации
-  
-  myservo.write(0);  // возвращаем сервопривод в начальное положение
-  delay(500);  // ждем полсекунды для стабилизации
+
+  if (irrecv.decode(&results)) {
+    handleIRInput(results.value);
+    irrecv.resume(); // Готовимся к приему следующего сигнала
+  }
+ 
+  // displayWeight(currentWeight, targetWeightThreshold);
+
+
+
+  digitalWrite(LCDpin, HIGH);
+
+
+          if (currentWeight >= targetWeightThreshold && motorRunning) {
+                Serial.println("Остановка мотора");
+                stopMotor();
+            } else if (currentWeight < targetWeightThreshold && !servosOpen && !motorRunning) {
+                Serial.println("Запуск мотора");
+                startMotor();
+            }
+
+    // Если кнопка "старт" нажата и мотор выключен, открыть сервоприводы и включить мотор // LOW && !motorRunning
+    if (digitalRead(startButtonPin) == LOW) {
+        stopMotor();
+        delay(1000);
+        openServos();
+        delay(1500);
+        closeServos();
+        delay(1500);
+        startMotor();
+        
+    }
+
+    // Если кнопка "тара" нажата, обнулить вес
+    if (digitalRead(tareButtonPin) == LOW) {
+        tareWeight();
+    }
+
+      // Вывод отладочной информации
+  Serial.print("Вес: ");
+  Serial.println(currentWeight);
+  Serial.print("Состояние мотора: ");
+  Serial.println(motorRunning ? "Включен" : "Выключен");
+
+  displayWeight(currentWeight, targetWeightThreshold);
+}
+
+
+void handleIRInput(unsigned long code) {
+  switch (code) {
+    case 0xFF18E7: // Код для увеличения порогового веса
+      targetWeightThreshold += 10;
+      forceUpdate = true;
+      break;
+    case 0xFF4AB5: // Код для уменьшения порогового веса
+      targetWeightThreshold = max(10, targetWeightThreshold - 10);
+      forceUpdate = true;
+      break;
+  }
+}
+
+void openServos() {
+    servo1.write(0);
+    servo2.write(90);
+    servosOpen = true;
+    startMillis = millis(); // Запоминаем время открытия сервопривода
+    Serial.println("OpenServos");
+}
+
+void closeServos() {
+    servo1.write(94);
+    servo2.write(3);
+    servosOpen = false;
+    Serial.println("CloseServos");
+}
+
+void startMotor() {
+    // Запуск мотора (ваш код)
+    motorRunning = true;
+    digitalWrite(stbyPin, HIGH); // Выход из режима ожидания
+    digitalWrite(bin1Pin, HIGH);
+    // digitalWrite(in2Pin, LOW);
+    analogWrite(pwmbPin, 255);
+   Serial.println("Motor start");
+}
+
+void stopMotor() {
+    // Остановка мотора (ваш код)
+    motorRunning = false;
+    digitalWrite(bin1Pin, LOW);
+    // digitalWrite(in2Pin, LOW);
+    analogWrite(pwmbPin, 0);
+    digitalWrite(stbyPin, LOW); // Перевод в режим ожидания
+   Serial.println("Motor stop");
+}
+
+// // void displayState() {
+//     // Вывод состояния работы мотора и состояния флага сервопривода на экран (ваш код)
+// }
+
+void tareWeight() {
+  scale.tare();
+  Serial.println("TARE GO");
+}
+
+// Добавьте переменную для хранения последнего отображенного значения веса
+int lastDisplayedWeight = 0;
+
+void displayWeight(float weight, int targetThreshold) {
+  int roundedWeight = round(weight);
+
+  // Проверяем, нужно ли обновить экран
+  if (abs(roundedWeight - lastDisplayedWeight) >= 1 || forceUpdate) {
+    tft.fillScreen(TFT_GREEN);
+    tft.setTextColor(TFT_BLACK);
+
+    // Строки состояния для сервопривода и мотора
+    String servoState = servosOpen ? "On" : "Off";
+    String motorState = motorRunning ? "On" : "Off";
+
+    // Отображаем вес и пороговое значение
+    String weightString = String(roundedWeight) + " g";
+    String thresholdString = "VES: " + String(targetThreshold) + " g";
+    String servoString = "Servo: " + servoState;
+    String motorString = "Motor: " + motorState;
+
+    // Расчет позиций для вывода текста
+    int startY = 15; // Начальная Y-позиция для текста
+    int stepY = 35; // Шаг между строками
+
+    tft.setCursor(0, startY);
+    tft.println(weightString);
+    tft.setCursor(0, startY + stepY);
+    tft.println(thresholdString);
+    tft.setCursor(0, startY + 2 * stepY);
+    tft.println(servoString);
+    tft.setCursor(0, startY + 3 * stepY);
+    tft.println(motorString);
+
+    // Обновляем последнее отображенное значение и сбрасываем флаг принудительного обновления
+    lastDisplayedWeight = roundedWeight;
+    forceUpdate = false;
+  }
 }
 
 
 
 
-
-
-// ///начало рабочего кода
-
-// #include <TFT_eSPI.h>
-// #include <HX711.h>
-// #include <ESP32Servo.h>
-// #include <Arduino.h>
-// #include <IRremoteESP8266.h>
-// #include <IRrecv.h>
-// #include <IRutils.h>
-// // Add this line to define the LCD backlight pin
-// #define LCDpin 15
-
-// #define IR_RECEIVE_PIN 16
-// IRrecv irrecv(IR_RECEIVE_PIN);
-// decode_results results;
-// bool forceUpdate = false; // Флаг принудительного обновления экрана
-
-
-// const int dtPin = 43;    // Пин DT подключен к GPIO 3
-// const int sckPin = 44;   // Пин SCK подключен к GPIO 2
-// const int servo1Pin = 2; // Пин для первого сервопривода
-// const int servo2Pin = 3; // Пин для второго сервопривода
-// const int startButtonPin = 11; // Пин для кнопки открытия сервоприводов
-// const int tareButtonPin = 12; // Пин для кнопки тары
-
-
-
-// // Пины управления L298N
-// const int bin1Pin = 17; //bIN1
-// // const int in2Pin = 0; //
-// const int pwmbPin = 21; //pwmb еще нужен stby указать
-// const int stbyPin = 18;
-
-// Servo servo1;
-// Servo servo2;
-
-// const float calibrationFactor = 0.002496; // Калибровочный коэффициент
-// // const int targetWeightThreshold = 100; // Порог веса для закрытия сервоприводов
-// int targetWeightThreshold = 100; // Начальное значение, допускается изменение
-
-
-// bool servosOpen = false; // Флаг открытия/закрытия сервоприводов
-// bool motorRunning = false; // Флаг мотора
-
-// TFT_eSPI tft = TFT_eSPI();
-// HX711 scale;
-
-// unsigned long previousMillis = 0;
-// const long interval = 100; // Интервал между измерениями в миллисекундах
-
-// // Буфер для усреднения значений веса
-// const int weightBufferLength = 10;
-// float weightBuffer[weightBufferLength];
-// int bufferIndex = 0;
-
-// // Прототипы функций
-// void displayWeight(float weight, int targetThreshold);
-// void openServos();
-// void closeServos();
-// void startMotor();
-// void stopMotor();
-// void displayState();
-// void tareWeight();
-// float getSmoothedWeight(float currentWeight);
-
-
- 
-// void handleIRInput(unsigned long code);
-
-
-// void setup() {
-// irrecv.enableIRIn(); // Включение приема ИК-сигналов
-
-
-//   // Настройка пинов 
-//   pinMode(bin1Pin, OUTPUT);
-//   // pinMode(in2Pin, OUTPUT);
-//   pinMode(pwmbPin, OUTPUT);
-//   pinMode(stbyPin, OUTPUT);
-
-
-//   // Начальное состояние
-//   digitalWrite(bin1Pin, HIGH);
-//   // digitalWrite(in2Pin, HIGH);
-//   digitalWrite(stbyPin, HIGH); // Выход из режима ожидания
-
-//   // Add these lines to configure the LCD backlight pin
-//   pinMode(LCDpin, OUTPUT);
-//   digitalWrite(LCDpin, HIGH);
-
-
-//   // Настройка PWM для управления скоростью мотора (если нужно)
-//   //analogWrite(enAPin, 255); // Максимальная скорость
-
-//   Serial.begin(115200);
-//   scale.begin(dtPin, sckPin);
-
-//   tft.init();
-//   tft.setRotation(3);
-//   //tft.fillScreen(TFT_GREEN);
-//   tft.setTextSize(3);
-
-//   pinMode(startButtonPin, INPUT_PULLUP);
-//   pinMode(tareButtonPin, INPUT_PULLUP);
-
-//   servo1.attach(servo1Pin);
-//   servo2.attach(servo2Pin);
-// }
-
-// float previousWeight = 0.0;
-// unsigned long startMillis = 0;
-// //const int analogInputPin = 4; 
-
-// void loop() {
-
-//  float currentWeight = scale.get_units(1) * calibrationFactor; // Пример получения текущего веса
-  
-
-//   if (irrecv.decode(&results)) {
-//     handleIRInput(results.value);
-//     irrecv.resume(); // Готовимся к приему следующего сигнала
-//   }
- 
-//   // displayWeight(currentWeight, targetWeightThreshold);
-
-
-
-//   digitalWrite(LCDpin, HIGH);
-
-
-//           if (currentWeight >= targetWeightThreshold && motorRunning) {
-//                 Serial.println("Остановка мотора");
-//                 stopMotor();
-//             } else if (currentWeight < targetWeightThreshold && !servosOpen && !motorRunning) {
-//                 Serial.println("Запуск мотора");
-//                 startMotor();
-//             }
-
-//     // Если кнопка "старт" нажата и мотор выключен, открыть сервоприводы и включить мотор // LOW && !motorRunning
-//     if (digitalRead(startButtonPin) == LOW) {
-//         stopMotor();
-//         delay(1000);
-//         openServos();
-//         delay(1500);
-//         closeServos();
-//         delay(1500);
-//         startMotor();
-        
-//     }
-
-//     // Если кнопка "тара" нажата, обнулить вес
-//     if (digitalRead(tareButtonPin) == LOW) {
-//         tareWeight();
-//     }
-
-//       // Вывод отладочной информации
-//   Serial.print("Вес: ");
-//   Serial.println(currentWeight);
-//   Serial.print("Состояние мотора: ");
-//   Serial.println(motorRunning ? "Включен" : "Выключен");
-
-//   displayWeight(currentWeight, targetWeightThreshold);
-// }
-
-
-// void handleIRInput(unsigned long code) {
-//   switch (code) {
-//     case 0xFF18E7: // Код для увеличения порогового веса
-//       targetWeightThreshold += 10;
-//       forceUpdate = true;
-//       break;
-//     case 0xFF4AB5: // Код для уменьшения порогового веса
-//       targetWeightThreshold = max(10, targetWeightThreshold - 10);
-//       forceUpdate = true;
-//       break;
-//   }
-// }
-
-
-
-
-
-// void openServos() {
-//     servo1.write(0);
-//     servo2.write(90);
-//     servosOpen = true;
-//     startMillis = millis(); // Запоминаем время открытия сервопривода
-//     Serial.println("OpenServos");
-// }
-
-// void closeServos() {
-//     servo1.write(94);
-//     servo2.write(3);
-//     servosOpen = false;
-//     Serial.println("CloseServos");
-// }
-
-// void startMotor() {
-//     // Запуск мотора (ваш код)
-//     motorRunning = true;
-//     digitalWrite(stbyPin, HIGH); // Выход из режима ожидания
-//     digitalWrite(bin1Pin, HIGH);
-//     // digitalWrite(in2Pin, LOW);
-//     analogWrite(pwmbPin, 255);
-//    Serial.println("Motor start");
-// }
-
-// void stopMotor() {
-//     // Остановка мотора (ваш код)
-//     motorRunning = false;
-//     digitalWrite(bin1Pin, LOW);
-//     // digitalWrite(in2Pin, LOW);
-//     analogWrite(pwmbPin, 0);
-//     digitalWrite(stbyPin, LOW); // Перевод в режим ожидания
-//    Serial.println("Motor stop");
-// }
-
-// // // void displayState() {
-// //     // Вывод состояния работы мотора и состояния флага сервопривода на экран (ваш код)
-// // }
-
-// void tareWeight() {
-//   scale.tare();
-//   Serial.println("TARE GO");
-// }
-
-// // Добавьте переменную для хранения последнего отображенного значения веса
-// int lastDisplayedWeight = 0;
-
-// void displayWeight(float weight, int targetThreshold) {
-//   int roundedWeight = round(weight);
-
-//   // Проверяем, нужно ли обновить экран
-//   if (abs(roundedWeight - lastDisplayedWeight) >= 1 || forceUpdate) {
-//     tft.fillScreen(TFT_GREEN);
-//     tft.setTextColor(TFT_BLACK);
-
-//     // Строки состояния для сервопривода и мотора
-//     String servoState = servosOpen ? "On" : "Off";
-//     String motorState = motorRunning ? "On" : "Off";
-
-//     // Отображаем вес и пороговое значение
-//     String weightString = String(roundedWeight) + " g";
-//     String thresholdString = "VES: " + String(targetThreshold) + " g";
-//     String servoString = "Servo: " + servoState;
-//     String motorString = "Motor: " + motorState;
-
-//     // Расчет позиций для вывода текста
-//     int startY = 15; // Начальная Y-позиция для текста
-//     int stepY = 35; // Шаг между строками
-
-//     tft.setCursor(0, startY);
-//     tft.println(weightString);
-//     tft.setCursor(0, startY + stepY);
-//     tft.println(thresholdString);
-//     tft.setCursor(0, startY + 2 * stepY);
-//     tft.println(servoString);
-//     tft.setCursor(0, startY + 3 * stepY);
-//     tft.println(motorString);
-
-//     // Обновляем последнее отображенное значение и сбрасываем флаг принудительного обновления
-//     lastDisplayedWeight = roundedWeight;
-//     forceUpdate = false;
-//   }
-// }
-
-
-
-
-// float getSmoothedWeight(float currentWeight) {
-//   // Усреднение значений веса
-//   weightBuffer[bufferIndex] = currentWeight;
-//   bufferIndex = (bufferIndex + 1) % weightBufferLength;
-
-//   float sum = 0;
-//   for (int i = 0; i < weightBufferLength; i++) {
-//     sum += weightBuffer[i];
-//   }
-
-//   return sum / weightBufferLength;
-// }
+float getSmoothedWeight(float currentWeight) {
+  // Усреднение значений веса
+  weightBuffer[bufferIndex] = currentWeight;
+  bufferIndex = (bufferIndex + 1) % weightBufferLength;
+
+  float sum = 0;
+  for (int i = 0; i < weightBufferLength; i++) {
+    sum += weightBuffer[i];
+  }
+
+  return sum / weightBufferLength;
+}
 
 
 
 
 
 //////////////////конец рабочего кода
+
+
+
+
+//тестер сервоприводов 
+// #include <TFT_eSPI.h>
+// #include <ESP32Servo.h>
+
+// Servo myservo;  // создаем объект сервопривода
+
+// int servoPin = 1;  // Пин ESP32 для сигнала
+
+// void setup() {
+//   Serial.begin(115200);  // инициализация серийного соединения для вывода
+//   myservo.attach(servoPin);  // подключаем сервопривод к выбранному пину
+//   Serial.println("Сервопривод подключен");
+// }
+
+// void loop() {
+//   // Проверка сервопривода с ограничением до 90 градусов на максимальной скорости
+//   Serial.println("Тест до 90 градусов на максимальной скорости:");
+  
+//   myservo.write(0);  // устанавливаем сервопривод в начальное положение
+//   delay(500);  // ждем полсекунды для стабилизации
+  
+//   myservo.write(90);  // перемещаем сервопривод на 90 градусов
+//   delay(500);  // ждем полсекунды для стабилизации
+  
+//   myservo.write(0);  // возвращаем сервопривод в начальное положение
+//   delay(500);  // ждем полсекунды для стабилизации
+// }
+
+
+
+
+
+
+
+
+
 
 
 // //////IR зелененькая работает которая использует резисторы и данные считывает все норм, значит код рабочии и меняет вес ОК жмем и наверх вниз все отображается на экране 14 марта 24г. 
